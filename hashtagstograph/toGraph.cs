@@ -1,200 +1,161 @@
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection.Metadata;
 using System.Text;
+using System.Threading.Tasks;
 using CsvHelper.Configuration;
-using Microsoft.Data.Sqlite;
 
 namespace hashtagstograph
 {
-    class Post
-    {
-        public string Id { get; set; }
-
-        public string[] Tags { get; set; }
-    }
-    
     class Program
     {
         // TODO: Find adjectives in tags
         // TODO: Perform sentiment analysis on tag-adjectives
         
-        static void Main()
+        private static async Task Read(IPostReader postReader, Index to)
         {
-            var centerTag = "#munich";
-            var minTagOccurrence = 1;
-            var minCoOccurrence = 1;
-            
-            int tagIdCounter = 0;
-            var distinctTagsWithTotalCount = new Dictionary<string, int>();
-            var distinctTagIDs = new Dictionary<string, int>();
-            
-            var tagsToPosts = new Dictionary<string, List<Post>>();
-            
-            using (var connection =
-                new SqliteConnection("Data Source=/home/daniel/Downloads/unterdb_DE.db;Cache=Shared"))
+            await Task.Run(() =>
             {
-                connection.Open();
-                
-                using (var cmd = new SqliteCommand("select id, tags from locations", connection))
-                using (var reader = cmd.ExecuteReader())
+                // Warning: Don't use "StringExtensions.GetHashCodeInt64(string str)" when
+                //          the hash should be persisted.
+                //          .Net Core generates a random hash seed on every program start
+                //          so that the generated hashes won't match in a later run. 
+                foreach (var post in postReader.ReadPosts(o => o))
                 {
-                    while (reader.Read())
+                    to.PostsById.TryAdd(post.Id, post);
+                    
+                    foreach (var postTag in post.Tags)
                     {
-                        var post = new Post
+                        var isNewTag = to.TotalOccurrencesByTagHash.AddOrUpdate(
+                            postTag.Hash,
+                            1,
+                            (key, existing) => existing + 1) == 1;
+
+                        if (isNewTag)
                         {
-                            Id = reader.GetString(0)
-                        };
+                            to.TagValuesByTagHash.TryAdd(postTag.Hash, postTag.Value);
+                        }
 
-                        var tagLine = reader.GetString(1);
+                        to.PostIdsByTagHash.AddOrUpdate(
+                            postTag.Hash,
+                            ImmutableHashSet.Create(new[] {post.Id}),
+                            (key, existing) => existing.Add(post.Id));
+                    }
+                }
+            });
+        }
 
-                        post.Tags = tagLine.Split("|")
-                            .Select(o =>
-                                o.Replace("\r", "")
-                                    .Replace("\n", "")
-                                    .ToLowerInvariant()
-                                    .Trim())
-                            .Where(o => o != "")
-                            .ToArray();
+        private static async Task<ConcurrentDictionary<string, (string, int)>> CountCoOccurrences(Index index)
+        {
+            var coOccurrences = new ConcurrentDictionary<string, (string, int)>();
+            
+            await Task.WhenAll(
+                index
+                .TagValuesByTagHash
+                .Keys
+                .Select(tagHash => 
+                    Task.Run(() => 
+                    {
+                        if (!index.PostIdsByTagHash.TryGetValue(tagHash, out var tagHashInPostIds))
+                            throw new Exception($"Index corrupt (tagHash '{tagHash}' couldn't be assigned to any post).");
 
-                        foreach (var tag in post.Tags)
+                        foreach (var postId in tagHashInPostIds)
                         {
-                            if (tag.Length == 0)
-                                continue;
+                            var otherTagHashesInPost = index
+                                .PostsById[postId]
+                                .Tags
+                                .Select(tag => tag.Hash);
                             
-                            string.Intern(tag);
+                            foreach (var otherTagHashInPost in otherTagHashesInPost)
+                            {
+                                if (tagHash == otherTagHashInPost)
+                                    continue;
 
-                            if (distinctTagsWithTotalCount.TryGetValue(tag, out var count))
-                            {
-                                distinctTagsWithTotalCount[tag] = count + 1;
-                            }
-                            else
-                            {
-                                distinctTagsWithTotalCount.Add(tag, 1);
-                                distinctTagIDs.Add(tag, tagIdCounter++); // Give each tag a unique ID
-                            }
-
-                            // Create a map that contains all posts which use this tag
-                            // Tag -> [posts that have this Tag]
-                            if (tagsToPosts.TryGetValue(tag, out var posts))
-                            {
-                                posts.Add(post);
-                            }
-                            else
-                            {
-                                posts = new List<Post>();
-                                posts.Add(post);
-                                tagsToPosts.Add(tag, posts);
+                                coOccurrences.AddOrUpdate(
+                                    tagHash,
+                                    (key) => (otherTagHashInPost, 1),
+                                    (key, current) => (current.Item1, current.Item2 + 1));
                             }
                         }
-                    }
-                }
+                    })));
+
+            return coOccurrences;
+        }
+        
+        static async Task Main()
+        {
+            var connectionString = "Data Source=/home/daniel/Downloads/unterdb_DE.db;Cache=Shared";
+            var query = "select id, tags from locations";
+            var hashSeparator = "|";
+            var nodesFilePath = "/home/daniel/Desktop/tag_nodes.csv";
+            var edgesFilePath = "/home/daniel/Desktop/tag_edges.csv";
+            var minCoOccurrence = 50;
+            
+            var index = new Index();
+            
+            var posts = new SqlitePostReader(
+                connectionString, 
+                query, 
+                hashSeparator);
+            
+            await Read(posts, to: index);
+
+            var foundEdges = await CountCoOccurrences(index);
+            var usedTags = new HashSet<string>();
+
+            var utf8WithoutBom = new UTF8Encoding(false);            
+            await using var edgesStream = File.Create(edgesFilePath);
+            await using var edgesWriter = new StreamWriter(edgesStream, utf8WithoutBom);
+            await using var edgesCsvWriter = new CsvHelper.CsvWriter(
+                edgesWriter,
+                new CsvConfiguration(CultureInfo.InvariantCulture));
+
+            edgesCsvWriter.WriteField("Source", true);
+            edgesCsvWriter.WriteField("Target", true);
+            edgesCsvWriter.WriteField("Weight", true);
+            edgesCsvWriter.NextRecord();
+
+            foreach (var edge in foundEdges)
+            {
+                if (edge.Value.Item2 < minCoOccurrence)
+                    continue;
+
+                usedTags.Add(edge.Key);
+                usedTags.Add(edge.Value.Item1);
+                
+                edgesCsvWriter.WriteField(edge.Key, true);
+                edgesCsvWriter.WriteField(edge.Value.Item1, true);
+                edgesCsvWriter.WriteField(edge.Value.Item2.ToString(), true);
+                edgesCsvWriter.NextRecord();
             }
             
-            var tagCombos = new Dictionary<string, Dictionary<string, int>>();
+            await using var nodesStream = File.Create(nodesFilePath);
+            await using var nodesWriter = new StreamWriter(nodesStream, utf8WithoutBom);
+            await using var nodesCsvWriter = new CsvHelper.CsvWriter(
+                nodesWriter,
+                new CsvConfiguration(CultureInfo.InvariantCulture));
 
-            // Loop trough all tags ..
-            foreach (var tag in distinctTagsWithTotalCount.Keys)
+            nodesCsvWriter.WriteField("Id", true);
+            nodesCsvWriter.WriteField("Label", true);
+            nodesCsvWriter.WriteField("Weight", true);
+            nodesCsvWriter.NextRecord();
+
+            foreach (var tag in index.TagValuesByTagHash)
             {
-                var distinctOtherTags = new Dictionary<string, int>();
-                
-                // .. then trough all posts which have this tag
-                foreach (var postsWithTag in tagsToPosts[tag])
-                {
-                    foreach (var otherTag in postsWithTag.Tags)
-                    {
-                        if (otherTag == tag)
-                            continue;
+                if (!usedTags.Contains(tag.Key)) // Skip all tags which have no links
+                    continue;
 
-                        if (distinctOtherTags.TryGetValue(otherTag, out var count))
-                        {
-                            distinctOtherTags[otherTag] = count + 1;
-                        }
-                        else
-                        {
-                            distinctOtherTags.Add(otherTag, 1);
-                        }
-                    }
-                }
-                
-                tagCombos.Add(tag, distinctOtherTags);
-            }
+                var totalOccurrences = index.TotalOccurrencesByTagHash[tag.Key];
 
-
-            var utf8WithoutBom = new UTF8Encoding(false);
-            using (var stream = File.Create("/home/daniel/Desktop/tag_edges.csv"))
-            using (var streamWriter = new StreamWriter(stream, utf8WithoutBom))
-            using (var csvWriter = new CsvHelper.CsvWriter(streamWriter, new CsvConfiguration(CultureInfo.InvariantCulture)))
-            using (var tagStream = File.Create("/home/daniel/Desktop/tag_nodes.csv"))
-            using (var tagStreamWriter = new StreamWriter(tagStream, utf8WithoutBom))
-            using (var tagWriter =
-                new CsvHelper.CsvWriter(tagStreamWriter, new CsvConfiguration(CultureInfo.InvariantCulture)))
-            {
-                csvWriter.WriteField("Source", false);
-                csvWriter.WriteField("Target", false);
-                csvWriter.WriteField("Weight", false);
-                csvWriter.NextRecord();  
-                    
-                tagWriter.WriteField("Id", false);
-                tagWriter.WriteField("Label", false);
-                tagWriter.WriteField("Weight", false);
-                tagWriter.NextRecord();                  
-                
-                var usedNodes = new HashSet<int>();
-                
-                foreach (var parentNode in tagCombos)
-                {
-                    if (distinctTagsWithTotalCount[parentNode.Key] < minTagOccurrence)
-                        continue;
-                    
-                    if (parentNode.Key != centerTag)
-                        continue;
-
-                    usedNodes.Add(distinctTagIDs[parentNode.Key]);
-                    
-                    tagWriter.WriteField(distinctTagIDs[parentNode.Key].ToString(), false);
-                    tagWriter.WriteField(parentNode.Key, true);
-                    tagWriter.WriteField(distinctTagsWithTotalCount[parentNode.Key].ToString(), false);
-                    tagWriter.NextRecord();
-
-                    foreach (var comboNode in parentNode.Value)
-                    {
-                        if (distinctTagsWithTotalCount[comboNode.Key] < minTagOccurrence)
-                            continue;
-                        if (comboNode.Value < minCoOccurrence)
-                            continue;
-                        
-                        if (!usedNodes.Contains(distinctTagIDs[comboNode.Key]))
-                        {
-                            usedNodes.Add(distinctTagIDs[comboNode.Key]);
-                        }
-                        else
-                        {
-                            continue;
-                        }
-
-                        tagWriter.WriteField(distinctTagIDs[comboNode.Key].ToString(), false);
-                        tagWriter.WriteField(comboNode.Key, true);
-                        tagWriter.WriteField(distinctTagsWithTotalCount[comboNode.Key].ToString(), false);
-                        tagWriter.NextRecord();
-                    }
-                    
-                    foreach (var a in parentNode.Value)
-                    {
-                        if (!usedNodes.Contains(distinctTagIDs[parentNode.Key]))
-                            continue;
-                        if (!usedNodes.Contains(distinctTagIDs[a.Key]))
-                            continue;
-                        if (a.Value < minCoOccurrence) // Erstelle nur Kanten zu Tags, die mind. N mal mit dem anderen Tag zusammen verwendet wurden.
-                            continue;
-                        
-                        csvWriter.WriteField(distinctTagIDs[parentNode.Key].ToString(), false);
-                        csvWriter.WriteField(distinctTagIDs[a.Key].ToString(), false);
-                        csvWriter.WriteField(a.Value.ToString(), false);
-                        csvWriter.NextRecord();
-                    }
-                }
+                nodesCsvWriter.WriteField(tag.Key, true);
+                nodesCsvWriter.WriteField(tag.Value, true);
+                nodesCsvWriter.WriteField(totalOccurrences.ToString(), true);
+                nodesCsvWriter.NextRecord();
             }
         }
     }
